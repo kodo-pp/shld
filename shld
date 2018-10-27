@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+
+set -e
+
+default_preload="/usr/share/shld/preload.sh"
+default_postload="/usr/share/shld/postload.sh"
+
+version="1.1.0"
+usage_str="Usage: shld [-v] [-o outfile] [-l lib] [-s lib] [-d lib] [-L path] [--dlib] [--lib] [-0 file] [-n file] [--prefer-(dynamic|static)] <infiles>"
+help_str="Usage: shld [options] <infiles>
+Linker for bash scripts
+Options:
+    --help           - Show this help message and exit
+    --usage          - Show short usage information and exit
+    --version        - Show version information and exit
+    -v | --verbose   - Be verbose
+    -o outfile       - Output linked script to 'outfile' (default is stdout)
+    -l lib           - Link 'lib' to the script
+    -d lib           - Link 'lib' to the script, force usage of dynamic libraries
+    -s lib           - Link 'lib' to the script, force usage of static libraries
+    -L path          - Add 'path' to library search path
+    --lib            - Output static library, gzipped by default
+    --dlib           - Output dynamic library, gzipped by default
+    -0 | --preload   - Force the specified file to appear first in the script.
+                         Default is ${default_preload} (if exists)
+    -n | --postload  - Force the specified file to appear last in the script.
+                         Default is ${default_postload} (if exists)
+    --prefer-static  - Prefer static libraries when linking with -l
+    --prefer-dynamic - Prefer dynamic libraries when linking with -l
+
+    infiles          - Files to link
+
+Libraries:
+    If you have a library located at (for example) /usr/lib/libfoo.shl, then you
+    link it with '-l foo' (or '-s foo')
+"
+
+function argc() {
+    echo "${#@}"
+}
+
+function usage_error() {
+    show_usage
+    exit 1
+}
+
+function show_help() {
+    echo "${help_str}"
+}
+
+function show_usage() {
+    echo "${usage_str}"
+}
+
+function show_version() {
+    echo "${version}"
+}
+
+function parse_arguments() {
+    declare -ag     o_dlibs=()
+    declare -ag     o_infiles=()
+    declare -ag     o_libpath=('/usr/lib')
+    declare -ag     o_libs=()
+    declare -g      o_outfile='/dev/stdout'
+    declare -g      o_output_type='exec'
+    declare -g      o_prefer='static'
+    declare -ag     o_slibs=()
+    declare -g      o_verbose='no'
+    declare -g      o_preload=''
+    declare -g      o_postload=''
+    while [[ "$(argc "$@")" -gt 0 ]]; do
+        local arg="$1"
+        shift
+
+        case "${arg}" in
+            --help)
+                show_help
+                exit 0
+                ;;
+            --usage)
+                show_usage
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                o_verbose='yes'
+                ;;
+            -o)
+                o_outfile="$1"
+                shift
+                if [[ -z "${o_outfile}" ]]; then
+                    echo "Empty outfile"
+                    usage_error
+                fi
+                ;;
+            -l)
+                local lib="$1"
+                shift
+                if [[ -z "${lib}" ]]; then
+                    echo "Empty lib"
+                    usage_error
+                fi
+                o_libs+=("${lib}")
+                ;;
+            -d)
+                local lib="$1"
+                shift
+                if [[ -z "${lib}" ]]; then
+                    echo "Empty lib"
+                    usage_error
+                fi
+                o_dlibs+=("${lib}")
+                ;;
+            -s)
+                local lib="$1"
+                shift
+                if [[ -z "${lib}" ]]; then
+                    echo "Empty lib"
+                    usage_error
+                fi
+                o_slibs+=("${lib}")
+                ;;
+            -L)
+                local path="$1"
+                shift
+                if [[ -z "${path}" ]]; then
+                    echo "Empty path"
+                    usage_error
+                fi
+                o_libpath+=("${path}")
+                ;;
+            --lib)
+                if [[ "${o_output_type}" != "exec" ]]; then
+                    echo "Multiple output type flags"
+                    usage_error
+                fi
+                o_output_type="lib"
+                ;;
+            --dlib)
+                if [[ "${o_output_type}" != "exec" ]]; then
+                    echo "Multiple output type flags"
+                    usage_error
+                fi
+                o_output_type="dlib"
+                ;;
+            --prefer-static)
+                o_prefer='static'
+                ;;
+            --prefer-dynamic)
+                o_prefer='dynamic'
+                ;;
+            -0|--preload)
+                local file="$1"
+                shift
+                if [[ -n "${o_preload}" ]]; then
+                    echo "Multiple preload files"
+                    usage_error
+                fi
+                if ! [[ -e "${file}" ]]; then
+                    echo "No such file: ${file}"
+                    usage_error
+                fi
+                o_preload="${file}"
+                ;;
+            -n|--postload)
+                local file="$1"
+                shift
+                if [[ -n "${o_postload}" ]]; then
+                    echo "Multiple postload files"
+                    usage_error
+                fi
+                if ! [[ -e "${file}" ]]; then
+                    echo "No such file: ${file}"
+                    usage_error
+                fi
+                o_postload="${file}"
+                ;;
+            -*)
+                echo "Unknown option: ${arg}"
+                usage_error
+                ;;
+            *)
+                o_infiles+=("${arg}")
+                ;;
+        esac
+    done
+
+    if [[ -z "${o_preload}" ]]; then
+        if [[ -e "${default_preload}" ]]; then
+            o_preload="${default_preload}"
+        else
+            o_preload="/dev/null"
+        fi
+    fi
+
+    if [[ -z "${o_postload}" ]]; then
+        if [[ -e "${default_postload}" ]]; then
+            o_postload="${default_postload}"
+        else
+            o_postload="/dev/null"
+        fi
+    fi
+}
+
+function error() {
+    echo "$@" >&2
+    kill -INT $$
+}
+
+function find_lib_file_any() {
+    local libname="$1"
+    local dir
+    for dir in "${o_libpath[@]}"; do
+        if [[ "${o_prefer}" == "static" ]]; then
+            if [[ -e "${dir}/lib${libname}.shl" ]]; then
+                echo "${dir}/lib${libname}.shl"
+                return
+            fi
+            if [[ -e "${dir}/lib${libname}.shld" ]]; then
+                echo "${dir}/lib${libname}.shld"
+                return
+            fi
+        else
+            if [[ -e "${dir}/lib${libname}.shld" ]]; then
+                echo "${dir}/lib${libname}.shld"
+                return
+            fi
+            if [[ -e "${dir}/lib${libname}.shl" ]]; then
+                echo "${dir}/lib${libname}.shl"
+                return
+            fi
+        fi
+    done
+}
+
+function find_lib_file_static() {
+    local libname="$1"
+    local dir
+    for dir in "${o_libpath[@]}"; do
+        if [[ -e "${dir}/lib${libname}.shl" ]]; then
+            echo "${dir}/lib${libname}.shl"
+            return
+        fi
+    done
+}
+
+function find_lib_file_dynamic() {
+    local libname="$1"
+    local dir
+    for dir in "${o_libpath[@]}"; do
+        if [[ -e "${dir}/lib${libname}.shld" ]]; then
+            echo "${dir}/lib${libname}.shld"
+            return
+        fi
+    done
+}
+
+function is_dynamic_libfile() {
+    local libfile="$1"
+    local ext="${libfile/*./}"
+    if [[ "${ext}" == "shld" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function find_lib_files() {
+    local libfiles=()
+    local i
+    for i in "${o_libs[@]}"; do
+        local libfile="$(find_lib_file_any "$i")"
+        if [[ -z "${libfile}" ]]; then
+            error "Unable to find library: $i"
+        fi
+        libfiles+=("${libfile}")
+    done
+    for i in "${o_slibs[@]}"; do
+        local libfile="$(find_lib_file_static "$i")"
+        if [[ -z "${libfile}" ]]; then
+            error "Unable to find static library: $i"
+        fi
+        libfiles+=("${libfile}")
+    done
+    for i in "${o_dlibs[@]}"; do
+        local libfile="$(find_lib_file_dynamic "$i")"
+        if [[ -z "${libfile}" ]]; then
+            error "Unable to find dynamic library: $i"
+        fi
+        libfiles+=("${libfile}")
+    done
+    echo "${libfiles[@]}"
+}
+
+function nlcat() {
+    local i
+    for i in "$@"; do
+        cat "$i"
+        echo
+    done
+}
+
+function link_exec() {
+    local libs=($(find_lib_files))
+    local slibs=()
+    local dlibs=()
+    local i
+    for i in "${libs[@]}"; do
+        if is_dynamic_libfile "$i"; then
+            dlibs+=("$i")
+        else
+            slibs+=("$i")
+        fi
+    done
+
+    if [[ "${#dlibs[@]}" -gt 0 ]]; then
+        local dlib_names=()
+        for i in "${dlibs[@]}"; do
+            local tmp1="${i/*\/lib/}"
+            dlib_names+=("${tmp1/.shld/}")
+        done
+        echo "#!/usr/bin/env bash
+        for _SHLD_dlib in ${dlib_names[@]}; do
+            _SHLD_success=0
+            for _SHLD_dir in \${SHLD_DLIB_PATH:-${o_libpath[@]}}; do
+                if [[ -e \"\${_SHLD_dir}/lib\${_SHLD_dlib}.shld\" ]]; then
+                    source \"\${_SHLD_dir}/lib\${_SHLD_dlib}.shld\"
+                    _SHLD_success=1
+                    break
+                fi
+            done
+            if [[ \"\${_SHLD_success}\" != 1 ]]; then
+                echo \"SHLD::DLIB: dynamic library '\${_SHLD_dlib}' not found\"
+                exit 118
+            fi
+        done
+        " | nlcat - "${o_preload}" "${slibs[@]}" "${o_infiles[@]}" "${o_postload}" > "${o_outfile}"
+    else
+        echo "#!/usr/bin/env bash" | nlcat - "${o_preload}" "${slibs[@]}" "${o_infiles[@]}" "${o_postload}" > "${o_outfile}"
+    fi
+    chmod +x "${o_outfile}"
+}
+
+function link_lib() {
+    local libs=($(find_lib_files))
+    local slibs=()
+    local dlibs=()
+    local i
+    for i in "${libs[@]}"; do
+        if is_dynamic_libfile; then
+            slibs+=("$i")
+        else
+            dlibs+=("$i")
+        fi
+    done
+
+    if [[ "${#dlibs[@]}" -gt 0 ]]; then
+        echo "for _SHLD::dlib in ${dlibs[@]}; do
+            for _SHLD::dir in \${SHLD_DLIB_PATH:-${o_libpath[@]}}; do
+                if [[ -e \"\${_SHLD::dir}/lib\${_SHLD::dlib}.shld\" ]]; then
+                    source \"\${_SHLD::dir}/lib\${_SHLD::dlib}.shld\"
+                    break
+                fi
+            done
+        done
+        " | nlcat - "${o_preload}" "${slibs[@]}" "${o_infiles[@]}" "${o_postload}" > "${o_outfile}"
+    else
+        nlcat "${o_preload}" "${slibs[@]}" "${o_infiles[@]}" "${o_postload}" > "${o_outfile}"
+    fi
+}
+
+function link_dlib() {
+    local libs=($(find_lib_files))
+    local slibs=()
+    local dlibs=()
+    local i
+    for i in "${libs[@]}"; do
+        if is_dynamic_libfile; then
+            slibs+=("$i")
+        else
+            dlibs+=("$i")
+        fi
+    done
+
+    if [[ "${#dlibs[@]}" -gt 0 ]]; then
+        echo "for _SHLD::dlib in ${dlibs[@]}; do
+            for _SHLD::dir in \${SHLD_DLIB_PATH:-${o_libpath[@]}}; do
+                if [[ -e \"\${_SHLD::dir}/lib\${_SHLD::dlib}.shld\" ]]; then
+                    source \"\${_SHLD::dir}/lib\${_SHLD::dlib}.shld\"
+                    break
+                fi
+            done
+        done
+        " | nlcat - "${o_preload}" "${slibs[@]}" "${o_infiles[@]}" "${o_postload}" > "${o_outfile}"
+    else
+        nlcat "${o_preload}" "${slibs[@]}" "${o_infiles[@]}" "${o_postload}" > "${o_outfile}"
+    fi
+}
+
+function main() {
+    parse_arguments "$@"
+    case "${o_output_type}" in
+        exec)
+            link_exec
+            ;;
+        lib)
+            link_lib
+            ;;
+        dlib)
+            link_dlib
+            ;;
+        *)
+            usage_error
+            ;;
+    esac
+}
+
+main "$@"

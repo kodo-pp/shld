@@ -1,0 +1,11 @@
+pak_name='shld'
+pak_version='1.1.0'
+pak_depends=()
+pak_license_file='LICENSE'
+
+pak_package() {
+    mkdir -p "$PAK_PKGDIR/usr/bin/"
+    install -m755 shld "$PAK_PKGDIR/usr/bin/"
+    mkdir -p "$PAK_PKGDIR/usr/share/shld/"
+    install -m644 {pre,post}load.sh "$PAK_PKGDIR/usr/share/shld/"
+}
